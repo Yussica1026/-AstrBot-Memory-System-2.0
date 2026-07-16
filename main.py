@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import os
 import sqlite3
+import struct
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -66,6 +67,32 @@ def jaccard(a: str, b: str) -> float:
     if not left or not right:
         return 0.0
     return len(left & right) / len(left | right)
+
+
+def pack_embedding(vec: list[float] | None) -> bytes | None:
+    if not vec:
+        return None
+    return struct.pack(f"{len(vec)}f", *[float(x) for x in vec])
+
+
+def unpack_embedding(blob: bytes | None) -> list[float] | None:
+    if not blob:
+        return None
+    if len(blob) % 4 != 0:
+        return None
+    size = len(blob) // 4
+    return list(struct.unpack(f"{size}f", blob))
+
+
+def cosine_similarity(left: list[float] | None, right: list[float] | None) -> float:
+    if not left or not right or len(left) != len(right):
+        return 0.0
+    dot = sum(a * b for a, b in zip(left, right))
+    left_norm = math.sqrt(sum(a * a for a in left))
+    right_norm = math.sqrt(sum(b * b for b in right))
+    if left_norm == 0 or right_norm == 0:
+        return 0.0
+    return dot / (left_norm * right_norm)
 
 
 def split_tags(tags: str | None) -> list[str]:
@@ -207,16 +234,26 @@ class MemoryStore:
                 return row
         return None
 
-    def related_ids_for(self, conn: sqlite3.Connection, content: str, exclude_id: int | None = None) -> str:
+    def related_ids_for(
+        self,
+        conn: sqlite3.Connection,
+        content: str,
+        exclude_id: int | None = None,
+        embedding: list[float] | None = None,
+    ) -> str:
         rows = conn.execute(
-            "SELECT id, content, aliases FROM memories WHERE fact_status = 'current' AND layer != 'archive'"
+            "SELECT id, content, aliases, embedding FROM memories WHERE fact_status = 'current' AND layer != 'archive'"
         ).fetchall()
         scored: list[tuple[float, int]] = []
         for row in rows:
             if exclude_id is not None and int(row["id"]) == exclude_id:
                 continue
             text = f"{row['content']} {row['aliases'] or ''}"
-            score = jaccard(content, text)
+            score = 0.0
+            if embedding is not None:
+                score = cosine_similarity(embedding, unpack_embedding(row["embedding"]))
+            if score <= 0:
+                score = jaccard(content, text)
             if score > 0:
                 scored.append((score, int(row["id"])))
         scored.sort(reverse=True)
@@ -231,6 +268,7 @@ class MemoryStore:
         arousal: float = 0.2,
         importance: int = 5,
         source: str = "",
+        embedding: list[float] | None = None,
     ) -> tuple[int, bool]:
         category = normalize_category(category)
         content = content.strip()
@@ -248,13 +286,14 @@ class MemoryStore:
                     merged_content = f"{merged_content}\n{content}"
                 merged_tags = merge_tags(duplicate["tags"], tags)
                 merged_importance = max(int(duplicate["importance"] or 1), importance)
-                related = self.related_ids_for(conn, merged_content, int(duplicate["id"]))
+                related = self.related_ids_for(conn, merged_content, int(duplicate["id"]), embedding)
                 decay = self.calculate_decay(duplicate)
                 conn.execute(
                     """
                     UPDATE memories
                     SET content = ?, tags = ?, importance = ?, valence = ?, arousal = ?,
-                        related_ids = ?, decay_score = ?, last_activated = ?, activation_count = activation_count + 1
+                        related_ids = ?, decay_score = ?, last_activated = ?, activation_count = activation_count + 1,
+                        embedding = COALESCE(?, embedding)
                     WHERE id = ?
                     """,
                     (
@@ -266,6 +305,7 @@ class MemoryStore:
                         related,
                         decay,
                         now_iso(),
+                        pack_embedding(embedding),
                         duplicate["id"],
                     ),
                 )
@@ -277,14 +317,27 @@ class MemoryStore:
                 INSERT INTO memories (
                     created_at, category, content, tags, valence, arousal, importance,
                     forgetting_score, decay_score, status, layer, activation_count,
-                    last_activated, resolved, related_ids, fact_status, source
+                    last_activated, resolved, embedding, related_ids, fact_status, source
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 'event', 1, ?, 0, '', 'current', ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 'event', 1, ?, 0, ?, '', 'current', ?)
                 """,
-                (created, category, content, tags, valence, arousal, importance, importance, importance, created, source),
+                (
+                    created,
+                    category,
+                    content,
+                    tags,
+                    valence,
+                    arousal,
+                    importance,
+                    importance,
+                    importance,
+                    created,
+                    pack_embedding(embedding),
+                    source,
+                ),
             )
             memory_id = int(cursor.lastrowid)
-            related = self.related_ids_for(conn, content, memory_id)
+            related = self.related_ids_for(conn, content, memory_id, embedding)
             conn.execute("UPDATE memories SET related_ids = ? WHERE id = ?", (related, memory_id))
             return memory_id, False
 
@@ -298,7 +351,14 @@ class MemoryStore:
             (now_iso(), memory_id),
         )
 
-    def query(self, keyword: str = "", category: str = "", limit: int = 5, include_archive: bool = False) -> list[sqlite3.Row]:
+    def query(
+        self,
+        keyword: str = "",
+        category: str = "",
+        limit: int = 5,
+        include_archive: bool = False,
+        query_embedding: list[float] | None = None,
+    ) -> list[sqlite3.Row]:
         self.refresh_decay()
         limit = clamp_int(limit, 1, 20, 5)
         keyword = (keyword or "").strip()
@@ -314,12 +374,15 @@ class MemoryStore:
 
         with self.connect() as conn:
             rows = conn.execute(sql, params).fetchall()
-            if keyword:
+            if keyword or query_embedding is not None:
                 scored: list[tuple[float, sqlite3.Row]] = []
                 for row in rows:
                     text = f"{row['content']} {row['tags'] or ''} {row['aliases'] or ''}"
-                    score = 1.0 if keyword in text else jaccard(keyword, text)
-                    if score >= 0.15:
+                    vector_score = cosine_similarity(query_embedding, unpack_embedding(row["embedding"]))
+                    text_score = 1.0 if keyword and keyword in text else jaccard(keyword, text)
+                    score = max(vector_score, text_score)
+                    threshold = 0.3 if vector_score >= text_score else 0.15
+                    if score >= threshold:
                         scored.append((score, row))
                 scored.sort(key=lambda item: (item[0], item[1]["id"]), reverse=True)
                 rows = [item[1] for item in scored[:limit]]
@@ -399,6 +462,16 @@ class MemoryStore:
         with self.connect() as conn:
             return conn.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
 
+    def list_memories_for_embedding(self) -> list[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT id, content FROM memories WHERE fact_status = 'current' AND embedding IS NULL ORDER BY id"
+            ).fetchall()
+
+    def update_embedding(self, memory_id: int, embedding: list[float]) -> None:
+        with self.connect() as conn:
+            conn.execute("UPDATE memories SET embedding = ? WHERE id = ?", (pack_embedding(embedding), memory_id))
+
     def stats(self) -> dict[str, int]:
         self.refresh_decay()
         with self.connect() as conn:
@@ -450,6 +523,31 @@ class AstrBotMemorySystem(Star):
         super().__init__(context)
         self.store = MemoryStore(DB_FILE)
 
+    def get_embedding_provider(self):
+        getter = getattr(self.context, "get_all_embedding_providers", None)
+        if not getter:
+            return None
+        try:
+            providers = getter() or []
+        except Exception:
+            return None
+        return providers[0] if providers else None
+
+    async def embed_text(self, text: str) -> list[float] | None:
+        provider = self.get_embedding_provider()
+        if not provider:
+            return None
+        try:
+            vector = await provider.get_embedding(text)
+        except Exception:
+            return None
+        if not isinstance(vector, list) or not vector:
+            return None
+        try:
+            return [float(x) for x in vector]
+        except (TypeError, ValueError):
+            return None
+
     @filter.command_group("memory")
     def memory(self):
         pass
@@ -457,7 +555,8 @@ class AstrBotMemorySystem(Star):
     @memory.command("save")
     async def cmd_memory_save(self, event: AstrMessageEvent, category: str, content: str):
         """保存记忆"""
-        memory_id, merged = self.store.save_memory(category, content, source="qq")
+        embedding = await self.embed_text(content)
+        memory_id, merged = self.store.save_memory(category, content, source="qq", embedding=embedding)
         action = "合并到已有记忆" if merged else "已保存记忆"
         yield event.plain_result(f"{action} #{memory_id}。")
 
@@ -470,13 +569,15 @@ class AstrBotMemorySystem(Star):
     @memory.command("search")
     async def cmd_memory_search(self, event: AstrMessageEvent, keyword: str):
         """关键词搜索记忆"""
-        rows = self.store.query(keyword=keyword, limit=5, include_archive=True)
+        embedding = await self.embed_text(keyword)
+        rows = self.store.query(keyword=keyword, limit=5, include_archive=True, query_embedding=embedding)
         yield event.plain_result(format_memory_list(rows))
 
     @memory.command("semantic")
     async def cmd_memory_semantic(self, event: AstrMessageEvent, query: str):
         """语义搜索记忆"""
-        rows = self.store.query(keyword=query, limit=5, include_archive=True)
+        embedding = await self.embed_text(query)
+        rows = self.store.query(keyword=query, limit=5, include_archive=True, query_embedding=embedding)
         yield event.plain_result(format_memory_list(rows))
 
     @memory.command("today")
@@ -509,7 +610,16 @@ class AstrBotMemorySystem(Star):
     async def cmd_memory_reindex(self, event: AstrMessageEvent):
         """重新计算衰减和关联"""
         self.store.refresh_decay()
-        yield event.plain_result("已重新计算记忆衰减状态。")
+        provider = self.get_embedding_provider()
+        embedded = 0
+        if provider:
+            for row in self.store.list_memories_for_embedding():
+                vector = await self.embed_text(row["content"])
+                if vector:
+                    self.store.update_embedding(int(row["id"]), vector)
+                    embedded += 1
+        suffix = f"，补算向量 {embedded} 条。" if provider else "。未检测到向量模型，保留文本相似度 fallback。"
+        yield event.plain_result(f"已重新计算记忆衰减状态{suffix}")
 
     @filter.llm_tool(name="memory_save")
     async def memory_save(
@@ -532,7 +642,10 @@ class AstrBotMemorySystem(Star):
             arousal(number): 唤醒度，0 到 1
             importance(number): 重要度，1 到 10
         """
-        memory_id, merged = self.store.save_memory(category, content, tags, valence, arousal, importance, "llm")
+        embedding = await self.embed_text(content)
+        memory_id, merged = self.store.save_memory(
+            category, content, tags, valence, arousal, importance, "llm", embedding=embedding
+        )
         action = "merged" if merged else "saved"
         return event.plain_result(f"{action} memory #{memory_id}")
 
@@ -545,7 +658,10 @@ class AstrBotMemorySystem(Star):
             category(string): 记忆分类，可为空
             limit(number): 返回数量
         """
-        rows = self.store.query(keyword=keyword, category=category, limit=limit, include_archive=True)
+        embedding = await self.embed_text(keyword) if keyword else None
+        rows = self.store.query(
+            keyword=keyword, category=category, limit=limit, include_archive=True, query_embedding=embedding
+        )
         return event.plain_result(format_memory_list(rows))
 
     @filter.llm_tool(name="memory_surface")
