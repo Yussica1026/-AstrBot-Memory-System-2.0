@@ -196,8 +196,7 @@ astrbot_plugin_memory_manager/
 ├── kb_auto_archive.py   知识库自动归档
 ├── memory_compress.py   记忆压缩工具
 ├── metadata.yaml        插件元数据
-├── TUTORIAL.txt         使用教程
-└── desire/              欲望系统子模块
+└── TUTORIAL.txt         使用教程
 ```
 
 ---
