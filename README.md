@@ -88,6 +88,8 @@ AstrBot 记忆系统 2.0 基于 SQLite 数据库存储记忆，作为 AstrBot St
 
 如果没有可用的向量模型，则会自动使用中文 Bigram Jaccard 作为 fallback。
 
+插件不会内置 API key 或固定向量模型。用户需要先在 AstrBot 的服务提供商里配置 Embedding 模型，插件会自动检测并调用已配置的 EmbeddingProvider。
+
 保存新记忆时，系统会自动寻找相关旧记忆，并建立关联。
 
 ---

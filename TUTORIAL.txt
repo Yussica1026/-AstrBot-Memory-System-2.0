@@ -14,6 +14,12 @@ AstrBot 记忆系统 2.0 使用说明
 /memory surface                 主动浮现记忆
 /memory reindex                 重新计算关联
 
+向量模型：
+- 插件不会保存或要求填写 API key。
+- 请在 AstrBot 服务提供商中自行配置 Embedding 模型。
+- 检测到 EmbeddingProvider 时，插件会自动保存和检索向量。
+- 未检测到 EmbeddingProvider 时，自动使用中文 Bigram Jaccard fallback。
+
 可用分类：
 happy / daily / sad / important / fight / milestone
 
