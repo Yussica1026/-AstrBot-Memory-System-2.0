@@ -1,0 +1,7 @@
+name: astrbot_plugin_memory_manager
+display_name: AstrBot 记忆系统 2.0
+desc: "为 AstrBot 提供长期记忆、衰减、浮现、关联、事实替代和承诺追踪。"
+version: "2.0.0"
+author: Project Maintainer
+repo: "https://github.com/Yussica1026/-AstrBot-Memory-System-2.0"
+type: common
