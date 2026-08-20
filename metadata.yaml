@@ -2,6 +2,6 @@ name: astrbot_plugin_memory_manager
 display_name: AstrBot 记忆系统 2.0
 desc: "为 AstrBot 提供长期记忆、衰减、浮现、关联、事实替代和承诺追踪。"
 version: "2.0.0"
-author: "小红书给我启发的老师们，叶枔枖，沈砚清，叶克宝"
+author: "叶枔枖，沈砚清，叶克宝"
 repo: "https://github.com/Yussica1026/-AstrBot-Memory-System-2.0"
 type: common
